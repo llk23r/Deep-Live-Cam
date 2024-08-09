@@ -1,9 +1,14 @@
 import os
+import io
 import webbrowser
+import tkinter as tk
 import customtkinter as ctk
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Optional
 import cv2
-from PIL import Image, ImageOps
+import PIL
+from PIL import Image, ImageOps, ImageTk
+import logging
+import sys
 
 import modules.globals
 import modules.metadata
@@ -11,6 +16,12 @@ from modules.face_analyser import get_one_face
 from modules.capturer import get_video_frame, get_video_frame_total
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import is_image, is_video, resolve_relative_path
+
+
+print(f"Python version: {sys.version}")
+print(f"PIL version: {PIL.__version__}")
+print(f"OpenCV version: {cv2.__version__}")
+print(f"CustomTkinter version: {ctk.__version__}")
 
 ROOT = None
 ROOT_HEIGHT = 700
@@ -32,6 +43,7 @@ status_label = None
 
 img_ft, vid_ft = modules.globals.file_types
 
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
 
 def init(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
     global ROOT, PREVIEW
@@ -125,7 +137,7 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
     preview.protocol('WM_DELETE_WINDOW', lambda: toggle_preview())
     preview.resizable(width=False, height=False)
 
-    preview_label = ctk.CTkLabel(preview, text=None)
+    preview_label = tk.Label(preview)
     preview_label.pack(fill='both', expand=True)
 
     preview_slider = ctk.CTkSlider(preview, from_=0, to=0, command=lambda frame_value: update_preview(frame_value))
@@ -143,6 +155,12 @@ def update_tumbler(var: str, value: bool) -> None:
 
 
 def select_source_path() -> None:
+    """
+    Handle the selection of a source image file.
+
+    This function opens a file dialog for the user to select an image file, then loads and
+    displays a preview of the selected image in the UI.
+    """
     global RECENT_DIRECTORY_SOURCE, img_ft, vid_ft
 
     PREVIEW.withdraw()
@@ -151,11 +169,14 @@ def select_source_path() -> None:
         modules.globals.source_path = source_path
         RECENT_DIRECTORY_SOURCE = os.path.dirname(modules.globals.source_path)
         image = render_image_preview(modules.globals.source_path, (200, 200))
-        source_label.configure(image=image)
+        if image:
+            source_label.configure(image=image)
+            source_label.image = image  # Keep a reference to prevent garbage collection
+        else:
+            source_label.configure(image=None, text="Error loading image")
     else:
         modules.globals.source_path = None
-        source_label.configure(image=None)
-
+        source_label.configure(image=None, text="No image selected")
 
 def select_target_path() -> None:
     global RECENT_DIRECTORY_TARGET, img_ft, vid_ft
@@ -192,11 +213,34 @@ def select_output_path(start: Callable[[], None]) -> None:
         start()
 
 
-def render_image_preview(image_path: str, size: Tuple[int, int]) -> ctk.CTkImage:
-    image = Image.open(image_path)
-    if size:
-        image = ImageOps.fit(image, size, Image.LANCZOS)
-    return ctk.CTkImage(image, size=image.size)
+def render_image_preview(image_path: str, size: Tuple[int, int]) -> Optional[tk.PhotoImage]:
+    """
+    Render an image preview for the UI.
+
+    This function loads an image from the given path, resizes it, and converts it to a format
+    compatible with Tkinter's PhotoImage. It supports various image formats, including WebP,
+    by converting them to PNG.
+
+    Args:
+        image_path (str): Path to the image file.
+        size (Tuple[int, int]): Desired size of the preview image (width, height).
+
+    Returns:
+        Optional[tk.PhotoImage]: A Tkinter PhotoImage object if successful, None otherwise.
+    """
+    try:
+        # Load and resize the image
+        with Image.open(image_path) as img:
+            img = img.resize(size, Image.LANCZOS)
+
+        # Convert image to PNG format in memory
+        with io.BytesIO() as png_buffer:
+            img.save(png_buffer, format="PNG")
+            png_buffer.seek(0)
+            return tk.PhotoImage(data=png_buffer.getvalue())
+    except Exception as e:
+        print(f"Error rendering image preview: {e}")
+        return None
 
 
 def render_video_preview(video_path: str, size: Tuple[int, int], frame_number: int = 0) -> ctk.CTkImage:
@@ -249,48 +293,111 @@ def update_preview(frame_number: int = 0) -> None:
         image = ctk.CTkImage(image, size=image.size)
         preview_label.configure(image=image)
 
+import tkinter as tk
+import cv2
+from PIL import Image
+import io
+
 def webcam_preview():
+    logging.debug("Entering webcam_preview function")
     if modules.globals.source_path is None:
-        # No image selected
+        logging.warning("No source image selected")
         return
-    
+
     global preview_label, PREVIEW
 
-    cap = cv2.VideoCapture(0)  # Use index for the webcam (adjust the index accordingly if necessary)    
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)  # Set the width of the resolution
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)  # Set the height of the resolution
-    cap.set(cv2.CAP_PROP_FPS, 60)  # Set the frame rate of the webcam
+    logging.debug("Initializing video capture")
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+    cap.set(cv2.CAP_PROP_FPS, 60)
     PREVIEW_MAX_WIDTH = 960
     PREVIEW_MAX_HEIGHT = 540
 
-    preview_label.configure(image=None)  # Reset the preview image before startup
+    logging.debug("Resetting preview label")
+    preview_label.configure(image=None)
 
-    PREVIEW.deiconify()  # Open preview window
+    logging.debug("Opening preview window")
+    PREVIEW.deiconify()
 
+    logging.debug("Getting frame processors")
     frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
 
-    source_image = None  # Initialize variable for the selected face image
+    source_image = None
 
+    frame_count = 0
     while True:
+        logging.debug(f"Processing frame {frame_count}")
         ret, frame = cap.read()
         if not ret:
+            logging.error("Failed to capture frame")
             break
 
-        # Select and save face image only once
         if source_image is None and modules.globals.source_path:
-            source_image = get_one_face(cv2.imread(modules.globals.source_path))
+            logging.debug("Loading source image")
+            try:
+                source_image = get_one_face(cv2.imread(modules.globals.source_path))
+                logging.debug("Source image loaded successfully")
+            except Exception as e:
+                logging.error(f"Error loading source image: {e}")
 
-        temp_frame = frame.copy()  #Create a copy of the frame
+        temp_frame = frame.copy()
 
-        for frame_processor in frame_processors:
-            temp_frame = frame_processor.process_frame(source_image, temp_frame)
+        for processor in frame_processors:
+            logging.debug(f"Applying frame processor: {processor.__name__}")
+            try:
+                temp_frame = processor.process_frame(source_image, temp_frame)
+            except Exception as e:
+                logging.error(f"Error in frame processor {processor.__name__}: {e}")
 
-        image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)  # Convert the image to RGB format to display it with Tkinter
-        image = Image.fromarray(image)
-        image = ImageOps.contain(image, (PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT), Image.LANCZOS)
-        image = ctk.CTkImage(image, size=image.size)
-        preview_label.configure(image=image)
-        ROOT.update()
+        logging.debug("Converting frame to RGB")
+        rgb_image = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
 
+        logging.debug("Converting to PIL Image")
+        pil_image = Image.fromarray(rgb_image)
+
+        logging.debug("Resizing image")
+        pil_image = pil_image.resize((PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT), Image.LANCZOS)
+
+        logging.debug("Creating PhotoImage")
+        try:
+            # Convert PIL image to PNG format
+            buffer = io.BytesIO()
+            pil_image.save(buffer, format='PNG')
+            buffer.seek(0)
+
+            # Create PhotoImage from PNG data
+            photo = tk.PhotoImage(data=buffer.getvalue())
+            logging.debug("PhotoImage created successfully")
+        except Exception as e:
+            logging.error(f"Error creating PhotoImage: {e}")
+            break
+
+        logging.debug("Updating preview label")
+        try:
+            preview_label.configure(image=photo)
+            preview_label.image = photo
+            logging.debug("Preview label updated successfully")
+        except Exception as e:
+            logging.error(f"Error updating preview label: {e}")
+            break
+
+        logging.debug("Updating ROOT")
+        try:
+            ROOT.update()
+            logging.debug("ROOT updated successfully")
+        except Exception as e:
+            logging.error(f"Error updating ROOT: {e}")
+            break
+
+        if not PREVIEW.winfo_exists():
+            logging.debug("Preview window closed")
+            break
+
+        frame_count += 1
+
+    logging.debug("Releasing video capture")
     cap.release()
-    PREVIEW.withdraw()  # Close preview window when loop is finished
+    logging.debug("Closing preview window")
+    PREVIEW.withdraw()
+    logging.debug("Exiting webcam_preview function")
